@@ -50,7 +50,7 @@ def aiogram_is_recent() -> bool:
 
 def ensure_dependencies() -> None:
     """Если нужных библиотек нет - ставит их из requirements.txt."""
-    needed = {"aiogram": "aiogram", "tzdata": "tzdata"}
+    needed = {"aiogram": "aiogram", "tzdata": "tzdata", "PIL": "pillow"}
     if all(importlib.util.find_spec(mod) for mod in needed) and aiogram_is_recent():
         return
     print("Не хватает библиотек или aiogram устарел, устанавливаю из requirements.txt ...")
@@ -76,8 +76,8 @@ from aiogram import Bot, Dispatcher, F  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
 from aiogram.enums import ParseMode  # noqa: E402
 from aiogram.exceptions import TelegramBadRequest  # noqa: E402
-from aiogram.filters import Command, CommandStart  # noqa: E402
-from aiogram.types import BotCommand, CallbackQuery, FSInputFile, Message, User  # noqa: E402
+from aiogram.filters import Command, CommandObject, CommandStart  # noqa: E402
+from aiogram.types import BotCommand, BufferedInputFile, CallbackQuery, FSInputFile, Message, User  # noqa: E402
 from aiogram.utils.keyboard import InlineKeyboardBuilder  # noqa: E402
 
 # ---------------- НАСТРОЙКИ ----------------
@@ -100,6 +100,10 @@ DUEL_ACCEPT_TIMEOUT = 120  # сколько секунд ждать, пока с
 RPS_TIMEOUT = 60         # сколько секунд на выбор в "камень-ножницы-бумага"
 THROW_TIMEOUT = 60       # сколько секунд на нажатие кнопки «Бросить»
 MAX_ROUNDS = 3           # сколько раз переигрывать при ничьей, потом ничья засчитывается
+CLEANUP_DUELS = True     # удалять служебные сообщения дуэли, оставляя только итог
+CLEANUP_RESULT = False     # удалять и итоговое сообщение (через RESULT_DELAY сек.)
+RESULT_DELAY = 60
+CLEANUP_DELAY = 6        # через сколько секунд после итога удалять сообщения
 DICE_WAIT = 4.5          # пауза, пока крутится анимация кубика/мяча (сек)
 
 # Папки с картинками (кладёшь свои файлы внутрь):
@@ -180,28 +184,30 @@ def pick_image(kind: str) -> Path | None:
     return random.choice(files) if files else None
 
 
-async def reply_with_image(message: Message, text: str, kind: str, reply: bool = True) -> None:
-    """Отправляет сообщение с картинкой из папки images/<kind>. Если картинок нет - просто текст.
-    reply=True - ответом на сообщение, reply=False - обычным сообщением в чат."""
+async def reply_with_image(message: Message, text: str, kind: str, reply: bool = True) -> Message:
+    """Отправляет сообщение с картинкой из папки images/<kind>. Если картинок нет или файл
+    не отправился - просто текст. reply=True - ответом на сообщение, False - обычным сообщением.
+    Возвращает отправленное сообщение."""
     send_text = message.reply if reply else message.answer
     send_photo = message.reply_photo if reply else message.answer_photo
     send_anim = message.reply_animation if reply else message.answer_animation
 
     img = pick_image(kind)
-    if img is None:
-        await send_text(text)
-        return
-
-    file = FSInputFile(img)
-    long_text = len(text) > 1000  # лимит подписи к фото - 1024 символа
-    caption = None if long_text else text
-
-    if img.suffix.lower() == ".gif":
-        await send_anim(file, caption=caption)
-    else:
-        await send_photo(file, caption=caption)
-    if long_text:
-        await message.answer(text)
+    if img is not None:
+        long_text = len(text) > 1000  # лимит подписи к фото - 1024 символа
+        caption = None if long_text else text
+        try:
+            file = FSInputFile(img)
+            if img.suffix.lower() == ".gif":
+                sent = await send_anim(file, caption=caption)
+            else:
+                sent = await send_photo(file, caption=caption)
+            if long_text:
+                await message.answer(text)
+            return sent
+        except Exception:
+            logging.exception("Не удалось отправить картинку %s, шлю текстом", img)
+    return await send_text(text)
 
 
 async def safe_edit(msg: Message | None, text: str, kb=None) -> None:
@@ -243,6 +249,7 @@ GAMES: dict[str, dict] = {
     "slots": {"emoji": "🎰", "title": "Слоты", "aliases": ["слоты", "слот", "slots", "казино"]},
     "rps": {"emoji": "✊", "title": "Камень-ножницы-бумага", "aliases": ["кнб", "rps", "камень"]},
 }
+DICE_MAX = {"🎰": 64, "🏀": 5, "⚽": 5}   # максимальное значение для остальных эмодзи - 6
 RANDOM_ALIASES = {"random", "рандом", "случайная", "любая"}
 
 SLOT_SYMBOLS = ["BAR", "🍇", "🍋", "7️⃣"]
@@ -277,8 +284,8 @@ def duel_help_text() -> str:
     games = "\n".join(f"{info['emoji']} {info['title']}" for info in GAMES.values())
     return (
         "⚔️ <b>Дуэль</b>\n"
-        "Напиши /duel - откроется меню с кнопками: выбери игру и ставку, "
-        "потом «Бросить вызов». Принять может любой в чате.\n"
+        "Напиши /duel - меню с кнопками придёт тебе в личку (его видишь только ты): выбери игру и ставку, "
+        "потом «Бросить вызов». Вызов появится в чате, принять может любой.\n"
         "Чтобы вызвать конкретного человека, ответь командой /duel на его сообщение.\n"
         "Быстрый вариант: <code>/duel кубик 5</code> - игра и ставка выбраны заранее.\n\n"
         f"<b>Игры:</b>\n{games}\n\n"
@@ -351,6 +358,12 @@ class Duel:
     throws: dict[int, int] = field(default_factory=dict)
     thrown: set[int] = field(default_factory=set)
     round_event: asyncio.Event = field(default_factory=asyncio.Event)
+    trash: list[Message] = field(default_factory=list)   # служебные сообщения на удаление
+    prompt: Message | None = None       # сообщение раунда с кнопкой броска
+    setup_msg: Message | None = None    # меню настройки (в личке вызывающего)
+    bot: object = None
+    prompt_text: str = ""
+    prompt_kb: object = None
 
     @property
     def opponent_label(self) -> str:
@@ -360,6 +373,39 @@ class Duel:
 DUELS: dict[str, Duel] = {}
 BUSY: set[tuple[int, int]] = set()      # (chat_id, user_id) - кто сейчас в дуэли
 BG_TASKS: set[asyncio.Task] = set()
+
+
+def track(duel: Duel, msg: Message | None) -> Message | None:
+    """Запоминает служебное сообщение, чтобы потом удалить его и не засорять чат."""
+    if msg is not None and CLEANUP_DUELS:
+        duel.trash.append(msg)
+    return msg
+
+
+async def delete_messages(msgs: list[Message]) -> None:
+    for m in msgs:
+        try:
+            await m.delete()
+        except Exception:
+            pass  # уже удалено или нет прав - не страшно
+
+
+async def clear_trash(duel: Duel) -> None:
+    msgs, duel.trash = duel.trash[:], []
+    await delete_messages(msgs)
+
+
+async def delayed_cleanup(msgs: list[Message], delay: float | None = None) -> None:
+    await asyncio.sleep(CLEANUP_DELAY if delay is None else delay)
+    await delete_messages(msgs)
+
+
+async def retire(duel: Duel, text: str, msg: Message | None = None) -> None:
+    """Дуэль не состоялась: пишет причину в сообщении и через несколько секунд его удаляет."""
+    target = msg or duel.msg
+    await safe_edit(target, text)
+    if CLEANUP_DUELS and target is not None:
+        spawn(delayed_cleanup([target]))
 
 
 def spawn(coro) -> None:
@@ -507,7 +553,8 @@ async def expire_duel(duel: Duel, token: int) -> None:
         text = f"⌛ Никто не принял вызов {duel.challenger_name}. Дуэль отменена."
     else:
         text = f"⌛ {duel.opponent_name} не ответил на вызов {duel.challenger_name}. Дуэль отменена."
-    await safe_edit(duel.msg, text)
+    await retire(duel, text, duel.setup_msg if was_setup else None)
+    await clear_trash(duel)
 
 
 def arm_timer(duel: Duel) -> None:
@@ -516,6 +563,14 @@ def arm_timer(duel: Duel) -> None:
 
 
 # ---------------- ДУЭЛИ: ХОД ИГРЫ ----------------
+async def wait_round(ready, timeout: float) -> None:
+    """Ждёт, пока ready() станет True, но не дольше timeout секунд."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while loop.time() < end and not ready():
+        await asyncio.sleep(0.3)
+
+
 async def play_dice_game(duel: Duel, game: str) -> tuple[str | None, str]:
     """Игра на Telegram-эмодзи: каждый игрок сам жмёт кнопку «Бросить»."""
     emoji = GAMES[game]["emoji"]
@@ -529,20 +584,19 @@ async def play_dice_game(duel: Duel, game: str) -> tuple[str | None, str]:
 
         kb = InlineKeyboardBuilder()
         kb.button(text=f"{emoji} Бросить!", callback_data=f"duel:throw:{duel.id}", style="success")
-        prompt = await duel.msg.answer(
+        duel.prompt_text = (
             f"{emoji} Раунд {rnd}: {a} и {b}, жмите кнопку, чтобы бросить!\n"
-            f"У вас {THROW_TIMEOUT} сек.",
-            reply_markup=kb.as_markup(),
+            f"У вас {THROW_TIMEOUT} сек."
         )
+        duel.prompt_kb = kb.as_markup()
+        prompt = track(duel, await duel.msg.answer(duel.prompt_text, reply_markup=duel.prompt_kb))
+        duel.prompt = prompt
         duel.throw_open = True
-        try:
-            await asyncio.wait_for(duel.round_event.wait(), THROW_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
+        await wait_round(lambda: len(duel.throws) >= 2, THROW_TIMEOUT)
         duel.throw_open = False
         try:
             await prompt.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
+        except Exception:
             pass
 
         va = duel.throws.get(duel.challenger_id)
@@ -562,8 +616,9 @@ async def play_dice_game(duel: Duel, game: str) -> tuple[str | None, str]:
         if sb > sa:
             return "b", line
         if rnd < MAX_ROUNDS:
-            await duel.msg.answer(f"🤝 Ничья!\n{line}\n\nБросаем ещё раз!")
-            await asyncio.sleep(1)
+            track(duel, await duel.msg.answer(f"🤝 Ничья!\n{line}\n\nБросаем ещё раз!"))
+            await asyncio.sleep(2.5)
+            await clear_trash(duel)   # неудачные попытки убираем из чата
     return None, line
 
 
@@ -578,20 +633,17 @@ async def play_rps(duel: Duel) -> tuple[str | None, str]:
         for key, (emo, title) in RPS_CHOICES.items():
             kb.button(text=f"{emo} {title}", callback_data=f"duel:rps:{duel.id}:{key}", style=RPS_STYLES[key])
         kb.adjust(3)
-        prompt = await duel.msg.answer(
+        prompt = track(duel, await duel.msg.answer(
             f"✊✌️✋ Раунд {rnd}: {a} и {b}, делайте выбор!\n"
             f"Выбор скрыт, пока не выберут оба. У вас {RPS_TIMEOUT} сек.",
             reply_markup=kb.as_markup(),
-        )
+        ))
         duel.rps_open = True
-        try:
-            await asyncio.wait_for(duel.round_event.wait(), RPS_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
+        await wait_round(lambda: len(duel.picks) >= 2, RPS_TIMEOUT)
         duel.rps_open = False
         try:
             await prompt.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
+        except Exception:
             pass
 
         pa = duel.picks.get(duel.challenger_id)
@@ -606,18 +658,19 @@ async def play_rps(duel: Duel) -> tuple[str | None, str]:
         line = f"{a}: {RPS_CHOICES[pa][0]} {RPS_CHOICES[pa][1]}\n{b}: {RPS_CHOICES[pb][0]} {RPS_CHOICES[pb][1]}"
         if pa == pb:
             if rnd < MAX_ROUNDS:
-                await duel.msg.answer(f"🤝 Одинаковый выбор!\n{line}\n\nЕщё раунд!")
+                track(duel, await duel.msg.answer(f"🤝 Одинаковый выбор!\n{line}\n\nЕщё раунд!"))
+                await asyncio.sleep(2.5)
+                await clear_trash(duel)
                 continue
             return None, line
         return ("a" if RPS_BEATS[pa] == pb else "b"), line
     return None, line
 
 
-async def finish_duel(duel: Duel, winner: str | None, line: str, game: str) -> None:
+async def finish_duel(duel: Duel, winner: str | None, line: str, game: str) -> Message | None:
     a, b = duel.challenger_name, duel.opponent_name
     if winner is None:
-        await duel.msg.answer(f"🤝 <b>Ничья!</b>\n{line}\n\nРазмеры Артёмов не меняются.")
-        return
+        return await duel.msg.answer(f"🤝 <b>Ничья!</b>\n{line}\n\nРазмеры Артёмов не меняются.")
 
     if winner == "a":
         win_id, win_name, lose_id, lose_name = duel.challenger_id, a, duel.opponent_id, b
@@ -631,25 +684,28 @@ async def finish_duel(duel: Duel, winner: str | None, line: str, game: str) -> N
         f"📈 {win_name}: +{duel.bet} см → <b>{w_size} см</b>\n"
         f"📉 {lose_name}: -{duel.bet} см → <b>{l_size} см</b>"
     )
-    await reply_with_image(duel.msg, text, "duel_win", reply=False)
+    return await reply_with_image(duel.msg, text, "duel_win", reply=False)
 
 
 async def run_duel(duel: Duel) -> None:
+    result: Message | None = None
     try:
         game = duel.game if duel.game != "random" else random.choice(list(GAMES))
         a, b = duel.challenger_name, duel.opponent_name
-        await reply_with_image(
+        track(duel, duel.msg)   # меню с вызовом тоже уберём после дуэли
+        started = await reply_with_image(
             duel.msg,
             f"⚔️ <b>Дуэль началась!</b>\n{a} VS {b}\n{game_title(game)} · 💰 ставка {duel.bet} см",
             "duel",
             reply=False,
         )
+        track(duel, started)
         await asyncio.sleep(1)
         if game == "rps":
             winner, line = await play_rps(duel)
         else:
             winner, line = await play_dice_game(duel, game)
-        await finish_duel(duel, winner, line, game)
+        result = await finish_duel(duel, winner, line, game)
     except Exception:
         logging.exception("Дуэль %s сломалась", duel.id)
         try:
@@ -659,16 +715,31 @@ async def run_duel(duel: Duel) -> None:
     finally:
         duel.state = "done"
         release(duel)
+        if duel.trash:
+            spawn(delayed_cleanup(duel.trash[:]))
+            duel.trash = []
+        if CLEANUP_DUELS and CLEANUP_RESULT and result is not None:
+            spawn(delayed_cleanup([result], RESULT_DELAY))
 
 
 # ---------------- КОМАНДЫ ----------------
 @dp.message(CommandStart())
 @dp.message(Command("help"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, command: CommandObject | None = None) -> None:
+    arg = (command.args or "") if command else ""
+    if arg.startswith("duel_") and message.chat.type == "private" and message.from_user:
+        duel = DUELS.get(arg[len("duel_"):])
+        if duel and duel.state == "setup" and duel.challenger_id == message.from_user.id:
+            duel.setup_msg = await message.answer(setup_text(duel), reply_markup=setup_kb(duel))
+            await clear_trash(duel)
+            return
+        await message.answer("Эта дуэль уже неактуальна. Напиши /duel в группе заново.")
+        return
     await message.answer(
         "👋 Я бот, где вы растите <b>Артёма</b> и соревнуетесь в чате!\n\n"
         "/artem - вырастить Артёма (раз в день)\n"
-        "/stats - статистика игроков этого чата\n"
+        "/stats - статистика таблицей\n"
+        "/statpic - статистика картинкой\n"
         "/duel - дуэль с мини-играми (ответом на сообщение соперника)\n\n"
         "Добавь меня в группу и играйте. Артём может как вырасти, так и уменьшиться 😈\n\n"
         + duel_help_text()
@@ -737,11 +808,9 @@ async def cmd_artem(message: Message) -> None:
     await reply_with_image(message, text, kind)
 
 
-@dp.message(Command("stats", "top"))
-async def cmd_stats(message: Message) -> None:
-    chat_id = message.chat.id
+def fetch_stats(chat_id: int) -> list[sqlite3.Row]:
     with db() as conn:
-        rows = conn.execute(
+        return conn.execute(
             """
             SELECT name, size, plays, duel_wins, duel_losses FROM players
             WHERE chat_id = ?
@@ -751,20 +820,132 @@ async def cmd_stats(message: Message) -> None:
             (chat_id, TOP_LIMIT),
         ).fetchall()
 
+
+def short(text: str, n: int) -> str:
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def stats_table_text(rows) -> str:
+    """Статистика таблицей (моноширинный текст, ровные колонки)."""
+    head = f"{'#':>2}  {'Игрок':<14} {'Артём':>7} {'Игры':>5} {'Дуэли':>7}"
+    lines = [head, "-" * len(head)]
+    for i, r in enumerate(rows, start=1):
+        name = short(html.unescape(r["name"]), 14)
+        duels = f"{r['duel_wins']}/{r['duel_losses']}"
+        lines.append(f"{i:>2}  {name:<14} {str(r['size']) + ' см':>7} {r['plays']:>5} {duels:>7}")
+    lines.append("")
+    lines.append("Дуэли: победы/поражения")
+    return "📊 <b>Статистика Артёмов в этом чате</b>\n<pre>" + html.escape("\n".join(lines)) + "</pre>"
+
+
+# ---------- статистика картинкой ----------
+FONT_DIR = BASE_DIR / "fonts"
+FONT_FALLBACKS = [
+    "/usr/share/fonts/truetype/dejavu/{name}",
+    "C:/Windows/Fonts/{alt}",
+    "/Library/Fonts/{alt}",
+    "/System/Library/Fonts/Supplemental/{alt}",
+]
+
+
+def load_font(size: int, bold: bool = False):
+    from PIL import ImageFont
+
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    alt = "arialbd.ttf" if bold else "arial.ttf"
+    candidates = [str(FONT_DIR / name)] + [p.format(name=name, alt=alt) for p in FONT_FALLBACKS]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def render_stats_png(rows, title: str) -> bytes:
+    """Рисует рейтинг Артёмов картинкой и возвращает PNG."""
+    import io
+
+    from PIL import Image, ImageDraw
+
+    W, PAD, ROW_H, HEAD_H = 960, 36, 78, 150
+    BG, CARD, TEXT, MUTED = (21, 26, 38), (31, 38, 56), (234, 240, 255), (140, 151, 178)
+    BLUE, GOLD, SILVER, BRONZE, GRAY = (76, 141, 255), (245, 197, 66), (184, 192, 204), (205, 127, 50), (58, 67, 88)
+    rank_colors = {1: GOLD, 2: SILVER, 3: BRONZE}
+
+    f_title, f_sub = load_font(40, True), load_font(22)
+    f_name, f_small, f_size, f_rank = load_font(28, True), load_font(20), load_font(32, True), load_font(26, True)
+
+    H = HEAD_H + ROW_H * len(rows) + PAD
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+
+    def fit(text: str, font, max_w: int) -> str:
+        if d.textlength(text, font=font) <= max_w:
+            return text
+        while text and d.textlength(text + "…", font=font) > max_w:
+            text = text[:-1]
+        return text + "…"
+
+    d.text((PAD, 30), fit(f"Артёмы · {title}", f_title, W - 2 * PAD), font=f_title, fill=TEXT)
+    d.text((PAD, 88), f"Рейтинг по размеру · {datetime.now(TZ).strftime('%d.%m.%Y')}", font=f_sub, fill=MUTED)
+
+    max_size = max((r["size"] for r in rows), default=1) or 1
+    bar_x, bar_w = 360, 330
+    for i, r in enumerate(rows, start=1):
+        y = HEAD_H + (i - 1) * ROW_H
+        d.rounded_rectangle((PAD, y, W - PAD, y + ROW_H - 10), radius=18, fill=CARD)
+        cy = y + (ROW_H - 10) // 2
+
+        color = rank_colors.get(i, GRAY)
+        d.ellipse((PAD + 14, cy - 22, PAD + 58, cy + 22), fill=color)
+        rank_fill = (30, 30, 30) if i <= 3 else TEXT
+        d.text((PAD + 36, cy), str(i), font=f_rank, fill=rank_fill, anchor="mm")
+
+        name = fit(html.unescape(r["name"]), f_name, 250)
+        d.text((PAD + 74, cy - 14), name, font=f_name, fill=TEXT, anchor="lm")
+        d.text(
+            (PAD + 74, cy + 18),
+            f"игр {r['plays']} · дуэли {r['duel_wins']}/{r['duel_losses']}",
+            font=f_small,
+            fill=MUTED,
+            anchor="lm",
+        )
+
+        d.rounded_rectangle((bar_x, cy - 9, bar_x + bar_w, cy + 9), radius=9, fill=GRAY)
+        fill_w = max(18, int(bar_w * r["size"] / max_size))
+        d.rounded_rectangle((bar_x, cy - 9, bar_x + fill_w, cy + 9), radius=9, fill=GOLD if i == 1 else BLUE)
+        d.text((W - PAD - 20, cy), f"{r['size']} см", font=f_size, fill=TEXT, anchor="rm")
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@dp.message(Command("stats", "top"))
+async def cmd_stats(message: Message) -> None:
+    """Статистика таблицей."""
+    rows = fetch_stats(message.chat.id)
     if not rows:
         await message.reply("Тут пока никто не растил Артёма. Начни с /artem!")
         return
+    await reply_with_image(message, stats_table_text(rows), "stats")
 
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    lines = ["📊 <b>Статистика Артёмов в этом чате:</b>\n"]
-    for i, r in enumerate(rows, start=1):
-        mark = medals.get(i, f"{i}.")
-        lines.append(
-            f"{mark} {r['name']} - <b>{r['size']} см</b> "
-            f"(игр: {r['plays']}, дуэли: {r['duel_wins']}🏆/{r['duel_losses']}💀)"
-        )
 
-    await reply_with_image(message, "\n".join(lines), "stats")
+@dp.message(Command("statpic", "statspic", "pic"))
+async def cmd_statpic(message: Message) -> None:
+    """Статистика картинкой."""
+    rows = fetch_stats(message.chat.id)
+    if not rows:
+        await message.reply("Тут пока никто не растил Артёма. Начни с /artem!")
+        return
+    title = html.unescape(message.chat.title) if getattr(message.chat, "title", None) else "наш чат"
+    try:
+        png = await asyncio.to_thread(render_stats_png, rows, title)
+        await message.reply_photo(BufferedInputFile(png, filename="stats.png"))
+    except Exception:
+        logging.exception("Не удалось нарисовать статистику, шлю таблицей")
+        await message.reply(stats_table_text(rows))
 
 
 @dp.message(Command("duel"))
@@ -821,9 +1002,32 @@ async def cmd_duel(message: Message) -> None:
         bet=bet,
         step="confirm" if (game_given and bet_given) else ("bet" if game_given else "game"),
     )
+    duel.bot = message.bot
     DUELS[duel.id] = duel
     BUSY.add((chat_id, me.id))
-    duel.msg = await message.answer(setup_text(duel), reply_markup=setup_kb(duel))
+    if CLEANUP_DUELS:
+        try:
+            await message.delete()   # команду убираем из чата (нужны права админа, иначе пропустим)
+        except Exception:
+            pass
+
+    # меню настройки видит только вызвавший: оно приходит ему в личку
+    try:
+        duel.setup_msg = await duel.bot.send_message(me.id, setup_text(duel), reply_markup=setup_kb(duel))
+        track(duel, await message.answer(f"📩 {duel.challenger_name}, меню дуэли отправлено тебе в личку с ботом."))
+    except Exception:
+        # бот не может писать первым - человек ещё не нажимал Start у бота
+        try:
+            username = (await duel.bot.me()).username
+        except Exception:
+            username = None
+        kb = InlineKeyboardBuilder()
+        if username:
+            kb.button(text="📩 Открыть меню в личке", url=f"https://t.me/{username}?start=duel_{duel.id}")
+        track(duel, await message.answer(
+            f"{duel.challenger_name}, нажми кнопку, открой личку со мной и жми Start - там настроишь дуэль.",
+            reply_markup=kb.as_markup() if username else None,
+        ))
     arm_timer(duel)
 
 
@@ -862,7 +1066,7 @@ async def cb_duel(cb: CallbackQuery) -> None:
             else:
                 await cb.answer()
                 return
-        await safe_edit(duel.msg, setup_text(duel), setup_kb(duel))
+        await safe_edit(duel.setup_msg, setup_text(duel), setup_kb(duel))
         await cb.answer()
         return
 
@@ -893,8 +1097,19 @@ async def cb_duel(cb: CallbackQuery) -> None:
                 )
                 return
             BUSY.add((duel.chat_id, duel.opponent_id))
+        try:
+            duel.msg = await duel.bot.send_message(
+                duel.chat_id, pending_text(duel), reply_markup=pending_kb(duel)
+            )
+        except Exception:
+            logging.exception("Не удалось отправить вызов в чат %s", duel.chat_id)
+            if duel.opponent_id is not None:
+                BUSY.discard((duel.chat_id, duel.opponent_id))
+            await cb.answer("Не получилось отправить вызов в чат. Я ещё в группе?", show_alert=True)
+            return
         duel.state = "pending"
-        await safe_edit(duel.msg, pending_text(duel), pending_kb(duel))
+        await clear_trash(duel)   # подсказки в группе больше не нужны
+        await retire(duel, "✅ Вызов отправлен в чат! Ждём ответа соперника.", duel.setup_msg)
         await cb.answer("Вызов отправлен!")
         arm_timer(duel)
         return
@@ -908,13 +1123,15 @@ async def cb_duel(cb: CallbackQuery) -> None:
         if not (is_challenger or is_opponent):
             await cb.answer("Это не твоя дуэль.", show_alert=True)
             return
+        was_setup = duel.state == "setup"
         duel.state = "declined"
         release(duel)
         if is_opponent:
             text = f"🏳️ {duel.opponent_name} отказался от дуэли с {duel.challenger_name}."
         else:
             text = f"🚫 {duel.challenger_name} отменил дуэль."
-        await safe_edit(duel.msg, text)
+        await retire(duel, text, duel.setup_msg if was_setup else None)
+        await clear_trash(duel)
         await cb.answer()
         return
 
@@ -942,7 +1159,7 @@ async def cb_duel(cb: CallbackQuery) -> None:
         if max_bet_for(get_size(duel.chat_id, duel.challenger_id)) < duel.bet:
             duel.state = "cancelled"
             release(duel)
-            await safe_edit(duel.msg, "🚫 Артём вызывающего стал слишком мал для этой ставки. Дуэль отменена.")
+            await retire(duel, "🚫 Артём вызывающего стал слишком мал для этой ставки. Дуэль отменена.")
             await cb.answer()
             return
 
@@ -972,12 +1189,23 @@ async def cb_duel(cb: CallbackQuery) -> None:
             await cb.answer("Ты уже бросил, ждём соперника.", show_alert=True)
             return
         duel.thrown.add(uid)
-        await cb.answer()
-        await duel.msg.answer(f"{duel.throw_emoji} {user_name(cb.from_user)} бросает!")
-        sent = await duel.msg.answer_dice(emoji=duel.throw_emoji)
-        duel.throws[uid] = sent.dice.value
-        if len(duel.throws) == 2:
-            duel.round_event.set()
+        try:
+            await cb.answer()
+        except Exception:
+            pass
+        value = None
+        try:
+            sent = track(duel, await duel.msg.answer_dice(emoji=duel.throw_emoji))
+            value = sent.dice.value
+        except Exception:
+            logging.exception("Не удалось отправить бросок (дуэль %s)", duel.id)
+        if value is None:   # запасной вариант, чтобы дуэль не зависла
+            value = random.randint(1, DICE_MAX.get(duel.throw_emoji, 6))
+        duel.throws[uid] = value
+        # статус обновляем в самом сообщении раунда, новых сообщений в чат не шлём
+        done = [n for i, n in ((duel.challenger_id, duel.challenger_name), (duel.opponent_id, duel.opponent_name)) if i in duel.throws]
+        status = "\n".join(f"✅ {n} бросил(а)" for n in done)
+        await safe_edit(duel.prompt, f"{duel.prompt_text}\n\n{status}", duel.prompt_kb if len(duel.throws) < 2 else None)
         return
 
     # ---- камень-ножницы-бумага ----
@@ -994,8 +1222,6 @@ async def cb_duel(cb: CallbackQuery) -> None:
             return
         duel.picks[uid] = choice
         await cb.answer(f"Ты выбрал: {RPS_CHOICES[choice][0]} {RPS_CHOICES[choice][1]}")
-        if len(duel.picks) == 2:
-            duel.round_event.set()
         return
 
     await cb.answer()
@@ -1003,7 +1229,8 @@ async def cb_duel(cb: CallbackQuery) -> None:
 
 BOT_COMMANDS = [
     BotCommand(command="artem", description="🍆 Вырастить Артёма (раз в день)"),
-    BotCommand(command="stats", description="📊 Статистика игроков чата"),
+    BotCommand(command="stats", description="📋 Статистика таблицей"),
+    BotCommand(command="statpic", description="🖼 Статистика картинкой"),
     BotCommand(command="duel", description="⚔️ Дуэль (ответом на сообщение соперника)"),
     BotCommand(command="help", description="❓ Справка и список игр"),
 ]
